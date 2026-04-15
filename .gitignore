@@ -1,5 +1,5 @@
 /target
-/bin
+# /bin
 .DS_Store
 /result
 # Env and .envrc files
