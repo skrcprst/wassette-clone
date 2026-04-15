@@ -1,0 +1,15 @@
+{
+  "name": "github-mcp",
+  "version": "1.0.0",
+  "description": "GitHub REST API integration as a WebAssembly component",
+  "type": "module",
+  "main": "github.js",
+  "scripts": {
+    "build": "jco componentize -w ./wit github.js -o github.wasm"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@bytecodealliance/componentize-js": "0.18.1",
+    "@bytecodealliance/jco": "^1.11.1"
+  }
+}

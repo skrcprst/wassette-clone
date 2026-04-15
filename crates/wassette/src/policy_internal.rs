@@ -1,0 +1,1500 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Policy management structures and types
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{anyhow, Result};
+use oci_wasm::WasmClient;
+use policy::{
+    AccessType, EnvironmentPermission, NetworkHostPermission, NetworkPermission, PolicyDocument,
+    PolicyParser, StoragePermission,
+};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+use tracing::{info, instrument, warn};
+
+use crate::component_storage::ComponentStorage;
+use crate::loader::{self, PolicyResource};
+use crate::{SecretsManager, WasiStateTemplate};
+
+/// Granular permission rule types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PermissionRule {
+    /// Network access permission
+    #[serde(rename = "network")]
+    Network(NetworkPermission),
+    /// File system storage permission
+    #[serde(rename = "storage")]
+    Storage(StoragePermission),
+    /// Environment variable access permission
+    #[serde(rename = "environment")]
+    Environment(EnvironmentPermission),
+    /// Custom permission with arbitrary data
+    #[serde(rename = "custom")]
+    Custom(String, serde_json::Value),
+}
+
+/// Permission grant request structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionGrantRequest {
+    /// The ID of the component requesting permission
+    pub component_id: String,
+    /// The type of permission being requested
+    pub permission_type: String,
+    /// Additional details specific to the permission type
+    pub details: serde_json::Value,
+}
+
+/// Registry for storing policy templates associated with components
+#[derive(Default)]
+pub(crate) struct PolicyRegistry {
+    /// Maps component IDs to their associated policy templates
+    pub(crate) component_policies: HashMap<String, Arc<WasiStateTemplate>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PolicyManager {
+    registry: Arc<RwLock<PolicyRegistry>>,
+    storage: ComponentStorage,
+    secrets: Arc<SecretsManager>,
+    environment_vars: Arc<HashMap<String, String>>,
+    oci_client: Arc<WasmClient>,
+    http_client: Client,
+}
+
+/// Information about a policy attached to a component
+#[derive(Debug, Clone)]
+pub struct PolicyInfo {
+    /// Unique identifier for the policy
+    pub policy_id: String,
+    /// The original URI where the policy was loaded from
+    pub source_uri: String,
+    /// Local filesystem path where the policy is stored
+    pub local_path: PathBuf,
+    /// ID of the component this policy is attached to
+    pub component_id: String,
+    /// Timestamp when the policy was created/attached
+    pub created_at: std::time::SystemTime,
+}
+
+impl PolicyManager {
+    pub(crate) fn new(
+        storage: ComponentStorage,
+        secrets: Arc<SecretsManager>,
+        environment_vars: Arc<HashMap<String, String>>,
+        oci_client: Arc<WasmClient>,
+        http_client: Client,
+    ) -> Self {
+        Self {
+            registry: Arc::new(RwLock::new(PolicyRegistry::default())),
+            storage,
+            secrets,
+            environment_vars,
+            oci_client,
+            http_client,
+        }
+    }
+
+    pub(crate) fn policy_path(&self, component_id: &str) -> PathBuf {
+        self.storage.policy_path(component_id)
+    }
+
+    pub(crate) fn metadata_path(&self, component_id: &str) -> PathBuf {
+        self.storage.policy_metadata_path(component_id)
+    }
+
+    pub(crate) async fn cleanup(&self, component_id: &str) {
+        self.registry
+            .write()
+            .await
+            .component_policies
+            .remove(component_id);
+    }
+
+    pub(crate) async fn store_template(
+        &self,
+        component_id: &str,
+        template: Arc<WasiStateTemplate>,
+    ) {
+        self.registry
+            .write()
+            .await
+            .component_policies
+            .insert(component_id.to_string(), template);
+    }
+
+    pub(crate) async fn template_for_component(
+        &self,
+        component_id: &str,
+    ) -> Arc<WasiStateTemplate> {
+        if let Some(existing) = self
+            .registry
+            .read()
+            .await
+            .component_policies
+            .get(component_id)
+            .cloned()
+        {
+            return existing;
+        }
+
+        self.build_default_template(component_id).await
+    }
+
+    /// Construct a default WASI template enriched with configured environment
+    /// variables and any stored secrets for the component.
+    async fn build_default_template(&self, component_id: &str) -> Arc<WasiStateTemplate> {
+        let mut config_vars = self.environment_vars.as_ref().clone();
+
+        if let Ok(secrets) = self.secrets.load_component_secrets(component_id).await {
+            for (key, value) in secrets {
+                config_vars.insert(key, value);
+            }
+        }
+
+        let template = WasiStateTemplate {
+            config_vars,
+            ..WasiStateTemplate::default()
+        };
+        Arc::new(template)
+    }
+
+    pub(crate) async fn attach_policy(&self, component_id: &str, policy_uri: &str) -> Result<()> {
+        info!(component_id, policy_uri, "Attaching policy to component");
+
+        let downloaded_policy = loader::load_resource::<PolicyResource>(
+            policy_uri,
+            &self.oci_client,
+            &self.http_client,
+        )
+        .await?;
+
+        let policy = PolicyParser::parse_file(downloaded_policy.as_ref())?;
+
+        let policy_path = self.policy_path(component_id);
+        tokio::fs::copy(downloaded_policy.as_ref(), &policy_path).await?;
+
+        let metadata = serde_json::json!({
+            "source_uri": policy_uri,
+            "attached_at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        });
+        let metadata_path = self.metadata_path(component_id);
+        tokio::fs::write(&metadata_path, serde_json::to_string_pretty(&metadata)?).await?;
+
+        let secrets = self.secrets.load_component_secrets(component_id).await.ok();
+
+        let wasi_template = crate::create_wasi_state_template_from_policy(
+            &policy,
+            self.storage.root(),
+            self.environment_vars.as_ref(),
+            secrets.as_ref(),
+        )?;
+
+        self.store_template(component_id, Arc::new(wasi_template))
+            .await;
+
+        info!(component_id, policy_uri, "Policy attached successfully");
+        Ok(())
+    }
+
+    pub(crate) async fn detach_policy(&self, component_id: &str) -> Result<()> {
+        info!(component_id, "Detaching policy from component");
+
+        let policy_path = self.policy_path(component_id);
+        self.storage
+            .remove_if_exists(&policy_path, "policy file", component_id)
+            .await?;
+
+        let metadata_path = self.metadata_path(component_id);
+        self.storage
+            .remove_if_exists(&metadata_path, "policy metadata file", component_id)
+            .await?;
+
+        self.cleanup(component_id).await;
+
+        info!(component_id, "Policy detached successfully");
+        Ok(())
+    }
+
+    pub(crate) async fn get_policy_info(&self, component_id: &str) -> Option<PolicyInfo> {
+        let policy_path = self.policy_path(component_id);
+        if !tokio::fs::try_exists(&policy_path).await.unwrap_or(false) {
+            return None;
+        }
+
+        let metadata_path = self.metadata_path(component_id);
+        let source_uri =
+            if let Ok(metadata_content) = tokio::fs::read_to_string(&metadata_path).await {
+                if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&metadata_content) {
+                    metadata
+                        .get("source_uri")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string()
+                } else {
+                    format!("file://{}", policy_path.display())
+                }
+            } else {
+                format!("file://{}", policy_path.display())
+            };
+
+        let metadata = tokio::fs::metadata(&policy_path).await.ok()?;
+        let created_at = metadata
+            .created()
+            .unwrap_or_else(|_| std::time::SystemTime::now());
+
+        Some(PolicyInfo {
+            policy_id: format!("{component_id}-policy"),
+            source_uri,
+            local_path: policy_path,
+            component_id: component_id.to_string(),
+            created_at,
+        })
+    }
+
+    pub(crate) async fn update_policy_registry(
+        &self,
+        component_id: &str,
+        policy: &PolicyDocument,
+    ) -> Result<()> {
+        let secrets = self.secrets.load_component_secrets(component_id).await.ok();
+
+        let wasi_template = crate::create_wasi_state_template_from_policy(
+            policy,
+            self.storage.root(),
+            self.environment_vars.as_ref(),
+            secrets.as_ref(),
+        )?;
+
+        self.store_template(component_id, Arc::new(wasi_template))
+            .await;
+        Ok(())
+    }
+
+    /// Rehydrate policy templates from a co-located policy file on disk, if
+    /// one exists for the component.
+    pub(crate) async fn restore_from_disk(&self, component_id: &str) -> Result<()> {
+        let policy_path = self.policy_path(component_id);
+        if !policy_path.exists() {
+            return Ok(());
+        }
+
+        let secrets = self.secrets.load_component_secrets(component_id).await.ok();
+
+        match tokio::fs::read_to_string(&policy_path).await {
+            Ok(policy_content) => match PolicyParser::parse_str(&policy_content) {
+                Ok(policy) => match crate::create_wasi_state_template_from_policy(
+                    &policy,
+                    self.storage.root(),
+                    self.environment_vars.as_ref(),
+                    secrets.as_ref(),
+                ) {
+                    Ok(wasi_template) => {
+                        self.store_template(component_id, Arc::new(wasi_template))
+                            .await;
+                        info!(component_id = %component_id, "Restored policy association from co-located file");
+                    }
+                    Err(e) => {
+                        warn!(component_id = %component_id, error = %e, "Failed to create WASI template from policy");
+                    }
+                },
+                Err(e) => {
+                    warn!(component_id = %component_id, error = %e, "Failed to parse co-located policy file");
+                }
+            },
+            Err(e) => {
+                warn!(component_id = %component_id, error = %e, "Failed to read co-located policy file");
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn revoke_storage_permission_by_uri(
+        &self,
+        component_id: &str,
+        uri: &str,
+    ) -> Result<()> {
+        if uri.is_empty() {
+            return Err(anyhow!("Storage URI cannot be empty"));
+        }
+        let mut policy = self.load_or_create_component_policy(component_id).await?;
+        self.remove_storage_permission_by_uri_from_policy(&mut policy, uri)?;
+        self.save_component_policy(component_id, &policy).await?;
+        self.update_policy_registry(component_id, &policy).await?;
+        Ok(())
+    }
+
+    /// Grant a specific permission rule to a component
+    #[instrument(skip(self))]
+    pub async fn grant_permission(
+        &self,
+        component_id: &str,
+        permission_type: &str,
+        details: &serde_json::Value,
+    ) -> Result<()> {
+        info!(
+            component_id,
+            permission_type, "Granting permission to component"
+        );
+        let permission_rule = self.parse_permission_rule(permission_type, details)?;
+        self.validate_permission_rule(&permission_rule)?;
+        let mut policy = self.load_or_create_component_policy(component_id).await?;
+        self.add_permission_rule_to_policy(&mut policy, permission_rule)?;
+        self.save_component_policy(component_id, &policy).await?;
+        self.update_policy_registry(component_id, &policy).await?;
+
+        info!(
+            component_id,
+            permission_type, "Permission granted successfully"
+        );
+        Ok(())
+    }
+
+    /// Parse a permission rule from the request details
+    fn parse_permission_rule(
+        &self,
+        permission_type: &str,
+        details: &serde_json::Value,
+    ) -> Result<PermissionRule> {
+        let permission_rule = match permission_type {
+            "network" => {
+                let host = details
+                    .get("host")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("Missing 'host' field for network permission"))?;
+                PermissionRule::Network(NetworkPermission::Host(NetworkHostPermission {
+                    host: host.to_string(),
+                }))
+            }
+            "storage" => {
+                let uri = details
+                    .get("uri")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("Missing 'uri' field for storage permission"))?;
+
+                // Check if access field exists
+                if let Some(access) = details.get("access") {
+                    // Access field exists - parse it
+                    let access_array = access
+                        .as_array()
+                        .ok_or_else(|| anyhow!("'access' field must be an array"))?;
+
+                    // If access array is empty, this is an error for grant operations
+                    if access_array.is_empty() {
+                        return Err(anyhow!("Storage access cannot be empty"));
+                    }
+
+                    let access_types: Result<Vec<AccessType>> = access_array
+                        .iter()
+                        .map(|v| v.as_str().ok_or_else(|| anyhow!("Invalid access type")))
+                        .map(|s| match s? {
+                            "read" => Ok(AccessType::Read),
+                            "write" => Ok(AccessType::Write),
+                            other => Err(anyhow!("Invalid access type: {}", other)),
+                        })
+                        .collect();
+
+                    PermissionRule::Storage(StoragePermission {
+                        uri: uri.to_string(),
+                        access: access_types?,
+                    })
+                } else {
+                    // No access field provided - used for revocation, create empty access
+                    PermissionRule::Storage(StoragePermission {
+                        uri: uri.to_string(),
+                        access: Vec::new(),
+                    })
+                }
+            }
+            "environment" | "environment-variable" => {
+                let key = details
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("Missing 'key' field for environment permission"))?;
+                PermissionRule::Environment(EnvironmentPermission {
+                    key: key.to_string(),
+                })
+            }
+            "resource" => {
+                // Handle both direct memory field and nested resources.limits.memory structure
+                let memory = if let Some(memory_str) =
+                    details.get("memory").and_then(|v| v.as_str())
+                {
+                    // Direct memory field (for backward compatibility or direct API calls)
+                    memory_str
+                } else if let Some(memory_str) = details
+                    .get("resources")
+                    .and_then(|r| r.get("limits"))
+                    .and_then(|l| l.get("memory"))
+                    .and_then(|m| m.as_str())
+                {
+                    // Nested structure from CLI (resources.limits.memory)
+                    memory_str
+                } else {
+                    return Err(anyhow!("Missing 'memory' field for resource permission. Expected either 'memory' or 'resources.limits.memory'"));
+                };
+
+                // Create structured resource limits instead of hardcoded JSON
+                let resource_limits = policy::ResourceLimits {
+                    limits: Some(policy::ResourceLimitValues::new(
+                        None,
+                        Some(policy::MemoryLimit::String(memory.to_string())),
+                    )),
+                    ..Default::default()
+                };
+
+                // Convert to JSON for storage in PermissionRule::Custom
+                let resource_details = serde_json::to_value(resource_limits)
+                    .map_err(|e| anyhow!("Failed to serialize resource limits: {}", e))?;
+                PermissionRule::Custom("resource".to_string(), resource_details)
+            }
+            other => {
+                // For custom permission types, store the type name and raw details
+                PermissionRule::Custom(other.to_string(), details.clone())
+            }
+        };
+
+        Ok(permission_rule)
+    }
+
+    /// Load or create component policy
+    pub(crate) async fn load_or_create_component_policy(
+        &self,
+        component_id: &str,
+    ) -> Result<policy::PolicyDocument> {
+        let policy_path = self.policy_path(component_id);
+
+        if policy_path.exists() {
+            let policy_content = tokio::fs::read_to_string(&policy_path).await?;
+            Ok(PolicyParser::parse_str(&policy_content)?)
+        } else {
+            // Create minimal policy document
+            Ok(policy::PolicyDocument {
+                version: "1.0".to_string(),
+                description: Some(format!(
+                    "Auto-generated policy for component: {component_id}"
+                )),
+                permissions: Default::default(),
+            })
+        }
+    }
+
+    /// Add permission rule to policy
+    fn add_permission_rule_to_policy(
+        &self,
+        policy: &mut policy::PolicyDocument,
+        rule: PermissionRule,
+    ) -> Result<()> {
+        match rule {
+            PermissionRule::Network(network) => {
+                self.add_network_permission_to_policy(policy, network)
+            }
+            PermissionRule::Storage(storage) => {
+                self.add_storage_permission_to_policy(policy, storage)
+            }
+            PermissionRule::Environment(env) => {
+                self.add_environment_permission_to_policy(policy, env)
+            }
+            PermissionRule::Custom(type_name, details) => {
+                if type_name == "resource" {
+                    self.add_resource_permission_to_policy(policy, details)
+                } else {
+                    Err(anyhow!(
+                        "Custom permission type '{}' not yet implemented",
+                        type_name
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Add network permission to policy
+    fn add_network_permission_to_policy(
+        &self,
+        policy: &mut PolicyDocument,
+        network: NetworkPermission,
+    ) -> Result<()> {
+        let allow_set = policy
+            .permissions
+            .network
+            .get_or_insert_with(Default::default)
+            .allow
+            .get_or_insert_with(Vec::new);
+
+        // Only add if not already present (prevent duplicates)
+        if !allow_set.contains(&network) {
+            allow_set.push(network);
+        }
+
+        Ok(())
+    }
+
+    /// Add storage permission to policy
+    fn add_storage_permission_to_policy(
+        &self,
+        policy: &mut PolicyDocument,
+        storage: StoragePermission,
+    ) -> Result<()> {
+        let allow_set = policy
+            .permissions
+            .storage
+            .get_or_insert_with(Default::default)
+            .allow
+            .get_or_insert_with(Vec::new);
+
+        // Check if we already have a permission for this URI
+        if let Some(existing) = allow_set.iter_mut().find(|p| p.uri == storage.uri) {
+            // Merge access types, ensuring no duplicates
+            for access_type in storage.access {
+                if !existing.access.contains(&access_type) {
+                    existing.access.push(access_type);
+                }
+            }
+        } else {
+            // Add new storage permission (only if not already present)
+            if !allow_set.contains(&storage) {
+                allow_set.push(storage);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn remove_storage_permission_by_uri_from_policy(
+        &self,
+        policy: &mut PolicyDocument,
+        uri: &str,
+    ) -> Result<()> {
+        if let Some(storage_perms) = &mut policy.permissions.storage {
+            if let Some(allow_set) = &mut storage_perms.allow {
+                allow_set.retain(|perm| perm.uri != uri);
+                if allow_set.is_empty() {
+                    storage_perms.allow = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Add environment permission to policy
+    fn add_environment_permission_to_policy(
+        &self,
+        policy: &mut PolicyDocument,
+        env: EnvironmentPermission,
+    ) -> Result<()> {
+        let allow_set = policy
+            .permissions
+            .environment
+            .get_or_insert_with(Default::default)
+            .allow
+            .get_or_insert_with(Vec::new);
+
+        // Only add if not already present (prevent duplicates)
+        if !allow_set.contains(&env) {
+            allow_set.push(env);
+        }
+
+        Ok(())
+    }
+
+    /// Add resource permission to policy
+    pub(crate) fn add_resource_permission_to_policy(
+        &self,
+        policy: &mut PolicyDocument,
+        details: serde_json::Value,
+    ) -> Result<()> {
+        // Extract the memory limit from the details - handle both original CLI format and converted ResourceLimits format
+        let memory_str = if let Some(memory_str) = details
+            .get("resources")
+            .and_then(|r| r.get("limits"))
+            .and_then(|l| l.get("memory"))
+            .and_then(|m| m.as_str())
+        {
+            // Original CLI format: {"resources": {"limits": {"memory": "512Mi"}}}
+            memory_str
+        } else if let Some(memory_str) = details
+            .get("limits")
+            .and_then(|l| l.get("memory"))
+            .and_then(|m| m.as_str())
+        {
+            // Converted ResourceLimits format: {"limits": {"memory": "512Mi"}}
+            memory_str
+        } else {
+            return Err(anyhow!(
+                "Invalid resource permission format: missing memory field"
+            ));
+        };
+
+        // Initialize resources if not present
+        let resources = policy
+            .permissions
+            .resources
+            .get_or_insert_with(Default::default);
+
+        // Initialize limits if not present
+        let limits = resources
+            .limits
+            .get_or_insert_with(|| policy::ResourceLimitValues::new(None, None));
+
+        // Set the memory limit
+        limits.memory = Some(policy::MemoryLimit::String(memory_str.to_string()));
+
+        Ok(())
+    }
+
+    /// Save component policy to file
+    pub(crate) async fn save_component_policy(
+        &self,
+        component_id: &str,
+        policy: &PolicyDocument,
+    ) -> Result<()> {
+        let policy_path = self.policy_path(component_id);
+        let policy_yaml = serde_yaml::to_string(policy)?;
+        tokio::fs::write(&policy_path, policy_yaml).await?;
+        Ok(())
+    }
+
+    /// Validate permission rule
+    fn validate_permission_rule(&self, rule: &PermissionRule) -> Result<()> {
+        match rule {
+            PermissionRule::Network(NetworkPermission::Host(NetworkHostPermission { host })) => {
+                if host.is_empty() {
+                    return Err(anyhow!("Network host cannot be empty"));
+                }
+            }
+            PermissionRule::Storage(storage) => {
+                // TODO: the validation should verify if the uri is actually valid or not
+                if storage.uri.is_empty() {
+                    return Err(anyhow!("Storage URI cannot be empty"));
+                }
+                // Note: access can be empty for revocation operations, but not for grant operations
+                // The validation for non-empty access is now done during parsing
+            }
+            PermissionRule::Environment(env) => {
+                if env.key.is_empty() {
+                    return Err(anyhow!("Environment variable key cannot be empty"));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Revoke a specific permission rule from a component
+    #[instrument(skip(self))]
+    pub async fn revoke_permission(
+        &self,
+        component_id: &str,
+        permission_type: &str,
+        details: &serde_json::Value,
+    ) -> Result<()> {
+        info!(
+            component_id,
+            permission_type, "Revoking permission from component"
+        );
+        let permission_rule = self.parse_permission_rule(permission_type, details)?;
+        self.validate_permission_rule(&permission_rule)?;
+        let mut policy = self.load_or_create_component_policy(component_id).await?;
+        self.remove_permission_rule_from_policy(&mut policy, permission_rule)?;
+        self.save_component_policy(component_id, &policy).await?;
+        self.update_policy_registry(component_id, &policy).await?;
+
+        info!(
+            component_id,
+            permission_type, "Permission revoked successfully"
+        );
+        Ok(())
+    }
+
+    /// Reset all permissions for a component
+    #[instrument(skip(self))]
+    pub async fn reset_permission(&self, component_id: &str) -> Result<()> {
+        info!(component_id, "Resetting all permissions for component");
+        // Remove policy files
+        let policy_path = self.policy_path(component_id);
+        self.storage
+            .remove_if_exists(&policy_path, "policy file", component_id)
+            .await?;
+
+        let metadata_path = self.metadata_path(component_id);
+        self.storage
+            .remove_if_exists(&metadata_path, "policy metadata file", component_id)
+            .await?;
+
+        // Remove from policy registry
+        self.cleanup(component_id).await;
+
+        info!(component_id, "All permissions reset successfully");
+        Ok(())
+    }
+
+    /// Remove permission rule from policy
+    fn remove_permission_rule_from_policy(
+        &self,
+        policy: &mut PolicyDocument,
+        rule: PermissionRule,
+    ) -> Result<()> {
+        match rule {
+            PermissionRule::Network(network) => {
+                self.remove_network_permission_from_policy(policy, network)
+            }
+            PermissionRule::Storage(storage) => {
+                self.remove_storage_permission_from_policy(policy, storage)
+            }
+            PermissionRule::Environment(env) => {
+                self.remove_environment_permission_from_policy(policy, env)
+            }
+            PermissionRule::Custom(type_name, details) => {
+                if type_name == "resource" {
+                    self.remove_resource_permission_from_policy(policy, details)
+                } else {
+                    Err(anyhow!(
+                        "Custom permission type '{}' not yet implemented",
+                        type_name
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Remove network permission from policy
+    fn remove_network_permission_from_policy(
+        &self,
+        policy: &mut PolicyDocument,
+        network: NetworkPermission,
+    ) -> Result<()> {
+        if let Some(network_perms) = &mut policy.permissions.network {
+            if let Some(allow_set) = &mut network_perms.allow {
+                allow_set.retain(|perm| perm != &network);
+                // Clean up empty structures
+                if allow_set.is_empty() {
+                    network_perms.allow = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove storage permission from policy
+    fn remove_storage_permission_from_policy(
+        &self,
+        policy: &mut PolicyDocument,
+        storage: StoragePermission,
+    ) -> Result<()> {
+        if let Some(storage_perms) = &mut policy.permissions.storage {
+            if let Some(allow_set) = &mut storage_perms.allow {
+                // Remove all permissions for the given URI, regardless of access type
+                allow_set.retain(|perm| perm.uri != storage.uri);
+                // Clean up empty structures
+                if allow_set.is_empty() {
+                    storage_perms.allow = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove environment permission from policy
+    fn remove_environment_permission_from_policy(
+        &self,
+        policy: &mut PolicyDocument,
+        env: EnvironmentPermission,
+    ) -> Result<()> {
+        if let Some(env_perms) = &mut policy.permissions.environment {
+            if let Some(allow_set) = &mut env_perms.allow {
+                allow_set.retain(|perm| perm != &env);
+                // Clean up empty structures
+                if allow_set.is_empty() {
+                    env_perms.allow = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove resource permission from policy
+    fn remove_resource_permission_from_policy(
+        &self,
+        policy: &mut PolicyDocument,
+        _details: serde_json::Value,
+    ) -> Result<()> {
+        if let Some(resources) = &mut policy.permissions.resources {
+            if let Some(limits) = &mut resources.limits {
+                // For now, we remove the memory limit entirely when revoking resource permission
+                // TODO: In the future, we might want to be more granular and only remove specific limits
+                limits.memory = None;
+
+                // Clean up empty structures
+                if limits.cpu.is_none() && limits.memory.is_none() {
+                    resources.limits = None;
+                }
+            }
+            // If resources has no limits and no requests, we could remove the entire resources section
+            // but for now we keep it for forward compatibility
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::*;
+
+    #[tokio::test]
+    async fn test_policy_attachment_and_detachment() -> Result<()> {
+        let manager = create_test_manager().await?;
+        manager.load_test_component().await?;
+
+        // Create a test policy file
+        let policy_content = r#"
+version: "1.0"
+description: "Test policy"
+permissions:
+  network:
+    allow:
+      - host: "example.com"
+  environment:
+    allow:
+      - key: "TEST_VAR"
+"#;
+        let policy_path = manager.component_root().join("test-policy.yaml");
+        tokio::fs::write(&policy_path, policy_content).await?;
+
+        let policy_uri = format!("file://{}", policy_path.display());
+
+        // Test policy attachment
+        manager
+            .attach_policy(TEST_COMPONENT_ID, &policy_uri)
+            .await?;
+
+        // Verify policy is attached
+        let policy_info = manager.get_policy_info(TEST_COMPONENT_ID).await;
+        assert!(policy_info.is_some());
+        let info = policy_info.unwrap();
+        assert_eq!(info.component_id, TEST_COMPONENT_ID);
+        assert_eq!(info.source_uri, policy_uri);
+
+        // Verify co-located policy file exists
+        let co_located_path = manager.get_component_policy_path(TEST_COMPONENT_ID);
+        assert!(co_located_path.exists());
+
+        // Test policy detachment
+        manager.detach_policy(TEST_COMPONENT_ID).await?;
+
+        // Verify policy is detached
+        let policy_info_after = manager.get_policy_info(TEST_COMPONENT_ID).await;
+        assert!(policy_info_after.is_none());
+
+        // Verify co-located policy file is removed
+        assert!(!co_located_path.exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_policy_attachment_component_not_found() -> Result<()> {
+        let manager = create_test_manager().await?;
+
+        let policy_content = r#"
+version: "1.0"
+description: "Test policy"
+permissions: {}
+"#;
+        let policy_path = manager.component_root().join("test-policy.yaml");
+        tokio::fs::write(&policy_path, policy_content).await?;
+
+        let policy_uri = format!("file://{}", policy_path.display());
+
+        // Test attaching policy to non-existent component
+        let result = manager.attach_policy("non-existent", &policy_uri).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Component not found"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grant_permission_network() -> Result<()> {
+        let manager = create_test_manager().await?;
+        manager.load_test_component().await?;
+
+        // Grant network permission
+        let details = serde_json::json!({"host": "api.example.com"});
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "network", &details)
+            .await?;
+
+        // Verify policy file was created and contains the permission
+        let policy_path = manager.get_component_policy_path(TEST_COMPONENT_ID);
+        assert!(policy_path.exists());
+
+        let policy_content = tokio::fs::read_to_string(&policy_path).await?;
+        assert!(policy_content.contains("api.example.com"));
+        assert!(policy_content.contains("network"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grant_permission_storage() -> Result<()> {
+        let manager = create_test_manager().await?;
+        manager.load_test_component().await?;
+
+        // Grant storage permission
+        let details = serde_json::json!({"uri": "fs:///tmp/test", "access": ["read", "write"]});
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "storage", &details)
+            .await?;
+
+        // Verify policy file was created and contains the permission
+        let policy_path = manager.get_component_policy_path(TEST_COMPONENT_ID);
+        assert!(policy_path.exists());
+
+        let policy_content = tokio::fs::read_to_string(&policy_path).await?;
+        assert!(policy_content.contains("fs:///tmp/test"));
+        assert!(policy_content.contains("storage"));
+        assert!(policy_content.contains("read"));
+        assert!(policy_content.contains("write"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grant_permission_duplicate_prevention() -> Result<()> {
+        let manager = create_test_manager().await?;
+        manager.load_test_component().await?;
+
+        let network_details = serde_json::json!({"host": "api.example.com"});
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "network", &network_details)
+            .await?;
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "network", &network_details)
+            .await?;
+
+        let env_details = serde_json::json!({"key": "API_KEY"});
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "environment", &env_details)
+            .await?;
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "environment", &env_details)
+            .await?;
+
+        let storage_details = serde_json::json!({"uri": "fs:///tmp/test", "access": ["read"]});
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "storage", &storage_details)
+            .await?;
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "storage", &storage_details)
+            .await?;
+
+        let storage_write_details =
+            serde_json::json!({"uri": "fs:///tmp/test", "access": ["write"]});
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "storage", &storage_write_details)
+            .await?;
+
+        let storage_different_uri =
+            serde_json::json!({"uri": "fs:///tmp/other", "access": ["read"]});
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "storage", &storage_different_uri)
+            .await?;
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "storage", &storage_different_uri)
+            .await?;
+
+        let policy_path = manager.get_component_policy_path(TEST_COMPONENT_ID);
+        let policy_content = tokio::fs::read_to_string(&policy_path).await?;
+
+        let network_occurrences = policy_content.matches("api.example.com").count();
+        assert_eq!(
+            network_occurrences, 1,
+            "Network host should appear only once"
+        );
+
+        let env_occurrences = policy_content.matches("API_KEY").count();
+        assert_eq!(
+            env_occurrences, 1,
+            "Environment key should appear only once"
+        );
+
+        let storage_test_occurrences = policy_content.matches("fs:///tmp/test").count();
+        assert_eq!(
+            storage_test_occurrences, 1,
+            "Storage URI fs:///tmp/test should appear only once"
+        );
+
+        let storage_other_occurrences = policy_content.matches("fs:///tmp/other").count();
+        assert_eq!(
+            storage_other_occurrences, 1,
+            "Storage URI fs:///tmp/other should appear only once"
+        );
+
+        assert!(
+            policy_content.contains("read"),
+            "Should contain read access"
+        );
+        assert!(
+            policy_content.contains("write"),
+            "Should contain write access"
+        );
+
+        let policy: policy::PolicyDocument = serde_yaml::from_str(&policy_content)?;
+
+        let network_perms = policy.permissions.network.as_ref().unwrap();
+        let network_allow = network_perms.allow.as_ref().unwrap();
+        assert_eq!(
+            network_allow.len(),
+            1,
+            "Should have exactly one network permission"
+        );
+
+        let env_perms = policy.permissions.environment.as_ref().unwrap();
+        let env_allow = env_perms.allow.as_ref().unwrap();
+        assert_eq!(
+            env_allow.len(),
+            1,
+            "Should have exactly one environment permission"
+        );
+
+        let storage_perms = policy.permissions.storage.as_ref().unwrap();
+        let storage_allow = storage_perms.allow.as_ref().unwrap();
+        assert_eq!(
+            storage_allow.len(),
+            2,
+            "Should have exactly two storage permissions"
+        );
+
+        let test_storage = storage_allow
+            .iter()
+            .find(|p| p.uri == "fs:///tmp/test")
+            .expect("Should have storage permission for fs:///tmp/test");
+        assert_eq!(
+            test_storage.access.len(),
+            2,
+            "Should have both read and write access"
+        );
+        assert!(test_storage.access.contains(&policy::AccessType::Read));
+        assert!(test_storage.access.contains(&policy::AccessType::Write));
+
+        let other_storage = storage_allow
+            .iter()
+            .find(|p| p.uri == "fs:///tmp/other")
+            .expect("Should have storage permission for fs:///tmp/other");
+        assert_eq!(
+            other_storage.access.len(),
+            1,
+            "Should have only read access"
+        );
+        assert!(other_storage.access.contains(&policy::AccessType::Read));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grant_permission_storage_access_merging() -> Result<()> {
+        let manager = create_test_manager().await?;
+        manager.load_test_component().await?;
+
+        // Grant read access first
+        let read_details = serde_json::json!({"uri": "fs:///tmp/test", "access": ["read"]});
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "storage", &read_details)
+            .await?;
+
+        // Grant write access to the same URI
+        let write_details = serde_json::json!({"uri": "fs:///tmp/test", "access": ["write"]});
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "storage", &write_details)
+            .await?;
+
+        // Verify policy file contains both access types for the same URI
+        let policy_path = manager.get_component_policy_path(TEST_COMPONENT_ID);
+        let policy_content = tokio::fs::read_to_string(&policy_path).await?;
+
+        // Should have both read and write access
+        assert!(policy_content.contains("read"));
+        assert!(policy_content.contains("write"));
+
+        // Should only have one URI entry
+        let uri_occurrences = policy_content.matches("fs:///tmp/test").count();
+        assert_eq!(uri_occurrences, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grant_permission_component_not_found() -> Result<()> {
+        let manager = create_test_manager().await?;
+
+        // Try to grant permission to non-existent component
+        let details = serde_json::json!({"host": "api.example.com"});
+        let result = manager
+            .grant_permission("non-existent", "network", &details)
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Component not found"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grant_permission_missing_required_fields() -> Result<()> {
+        let manager = create_test_manager().await?;
+        manager.load_test_component().await?;
+
+        // Try to grant network permission without host field
+        let details = serde_json::json!({});
+        let result = manager
+            .grant_permission(TEST_COMPONENT_ID, "network", &details)
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Missing 'host' field"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grant_permission_validation_empty_host() -> Result<()> {
+        let manager = create_test_manager().await?;
+        manager.load_test_component().await?;
+
+        // Try to grant network permission with empty host
+        let details = serde_json::json!({"host": ""});
+        let result = manager
+            .grant_permission(TEST_COMPONENT_ID, "network", &details)
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Network host cannot be empty"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grant_permission_multiple_permissions() -> Result<()> {
+        let manager = create_test_manager().await?;
+        manager.load_test_component().await?;
+
+        // Grant multiple different permissions
+        let network_details = serde_json::json!({"host": "api.example.com"});
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "network", &network_details)
+            .await?;
+
+        let storage_details = serde_json::json!({"uri": "fs:///tmp/test", "access": ["read"]});
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "storage", &storage_details)
+            .await?;
+
+        // Verify policy file contains all permissions
+        let policy_path = manager.get_component_policy_path(TEST_COMPONENT_ID);
+        let policy_content = tokio::fs::read_to_string(&policy_path).await?;
+
+        assert!(policy_content.contains("api.example.com"));
+        assert!(policy_content.contains("fs:///tmp/test"));
+        assert!(policy_content.contains("network"));
+        assert!(policy_content.contains("storage"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grant_permission_updates_policy_registry() -> Result<()> {
+        let manager = create_test_manager().await?;
+        manager.load_test_component().await?;
+
+        // Grant permission
+        let details = serde_json::json!({"host": "api.example.com"});
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "network", &details)
+            .await?;
+
+        // Verify policy registry was updated by attempting to get WASI state
+        let _wasi_state = manager
+            .get_wasi_state_for_component(TEST_COMPONENT_ID)
+            .await?;
+
+        // If we get here without error, the policy registry was updated successfully
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grant_permission_to_existing_policy() -> Result<()> {
+        let manager = create_test_manager().await?;
+        manager.load_test_component().await?;
+
+        // First, attach a policy using the existing system
+        let policy_content = r#"
+version: "1.0"
+description: "Initial policy"
+permissions:
+  network:
+    allow:
+      - host: "initial.example.com"
+"#;
+        let policy_path = manager.component_root().join("initial-policy.yaml");
+        tokio::fs::write(&policy_path, policy_content).await?;
+
+        let policy_uri = format!("file://{}", policy_path.display());
+        manager
+            .attach_policy(TEST_COMPONENT_ID, &policy_uri)
+            .await?;
+
+        // Now grant additional permission using granular system
+        let details = serde_json::json!({"host": "additional.example.com"});
+        manager
+            .grant_permission(TEST_COMPONENT_ID, "network", &details)
+            .await?;
+
+        // Verify both permissions exist in the policy file
+        let co_located_path = manager.get_component_policy_path(TEST_COMPONENT_ID);
+        let final_policy_content = tokio::fs::read_to_string(&co_located_path).await?;
+
+        assert!(final_policy_content.contains("initial.example.com"));
+        assert!(final_policy_content.contains("additional.example.com"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_permission_rule_serialization() -> Result<()> {
+        // Test serialization of PermissionRule
+        let network_rule =
+            PermissionRule::Network(NetworkPermission::Host(NetworkHostPermission {
+                host: "example.com".to_string(),
+            }));
+        let serialized = serde_json::to_string(&network_rule)?;
+        assert!(serialized.contains("example.com"));
+
+        let storage_rule = PermissionRule::Storage(StoragePermission {
+            uri: "fs:///tmp/test".to_string(),
+            access: vec![AccessType::Read, AccessType::Write],
+        });
+        let serialized = serde_json::to_string(&storage_rule)?;
+        assert!(serialized.contains("fs:///tmp/test"));
+        assert!(serialized.contains("read"));
+        assert!(serialized.contains("write"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_permission_type_enum() -> Result<()> {
+        // Test that PermissionRule properly wraps different permission types
+        let network_perm =
+            PermissionRule::Network(NetworkPermission::Host(NetworkHostPermission {
+                host: "example.com".to_string(),
+            }));
+        let storage_perm = PermissionRule::Storage(StoragePermission {
+            uri: "fs:///tmp".to_string(),
+            access: vec![AccessType::Read, AccessType::Write],
+        });
+        let env_perm = PermissionRule::Environment(EnvironmentPermission {
+            key: "API_KEY".to_string(),
+        });
+        let custom_perm = PermissionRule::Custom(
+            "custom-type".to_string(),
+            serde_json::json!({"custom": "data"}),
+        );
+
+        // Test serialization/deserialization
+        let network_rule = network_perm;
+        let serialized = serde_json::to_string(&network_rule)?;
+        let _deserialized: PermissionRule = serde_json::from_str(&serialized)?;
+
+        // Test that the variants can be created and used
+        assert!(matches!(storage_perm, PermissionRule::Storage(_)));
+        assert!(matches!(env_perm, PermissionRule::Environment(_)));
+        assert!(matches!(custom_perm, PermissionRule::Custom(_, _)));
+
+        // Test pattern matching works correctly
+        let rule = PermissionRule::Network(NetworkPermission::Host(NetworkHostPermission {
+            host: "test.com".to_string(),
+        }));
+        match rule {
+            PermissionRule::Network(NetworkPermission::Host(NetworkHostPermission { host })) => {
+                assert_eq!(host, "test.com");
+            }
+            _ => panic!("Expected network permission"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_resource_permission_to_policy() -> Result<()> {
+        let manager_result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { create_test_manager().await });
+        let manager = manager_result.unwrap();
+
+        // Create a minimal policy
+        let mut policy = policy::PolicyDocument {
+            version: "1.0".to_string(),
+            description: Some("Test policy".to_string()),
+            permissions: policy::Permissions::default(),
+        };
+
+        // Test adding resource permission
+        let resource_details = serde_json::json!({
+            "resources": {
+                "limits": {
+                    "memory": "512Mi"
+                }
+            }
+        });
+
+        manager
+            .manager
+            .policy_manager
+            .add_resource_permission_to_policy(&mut policy, resource_details)?;
+
+        // Verify the policy has the resource permission
+        let resources = policy.permissions.resources.expect("Should have resources");
+        let limits = resources.limits.expect("Should have limits");
+        let memory = limits.memory.expect("Should have memory limit");
+
+        match memory {
+            policy::MemoryLimit::String(mem_str) => {
+                assert_eq!(mem_str, "512Mi");
+            }
+            _ => panic!("Expected string memory limit"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_access_type_serialization() -> Result<()> {
+        // Test serialization of AccessType
+        let read_access = AccessType::Read;
+        let serialized = serde_json::to_string(&read_access)?;
+        assert_eq!(serialized, "\"read\"");
+
+        let write_access = AccessType::Write;
+        let serialized = serde_json::to_string(&write_access)?;
+        assert_eq!(serialized, "\"write\"");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_memory_resource_revocation() -> Result<()> {
+        let manager_result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { create_test_manager().await });
+        let manager = manager_result.unwrap();
+
+        // Create a policy with memory resource limits
+        let mut policy = policy::PolicyDocument {
+            version: "1.0".to_string(),
+            description: Some("Test policy with memory limits".to_string()),
+            permissions: policy::Permissions::default(),
+        };
+
+        // First add memory resource permission
+        let resource_details = serde_json::json!({
+            "resources": {
+                "limits": {
+                    "memory": "512Mi"
+                }
+            }
+        });
+
+        manager
+            .manager
+            .policy_manager
+            .add_resource_permission_to_policy(&mut policy, resource_details.clone())?;
+
+        // Verify memory limit was added
+        let resources = policy
+            .permissions
+            .resources
+            .as_ref()
+            .expect("Should have resources");
+        let limits = resources.limits.as_ref().expect("Should have limits");
+        let memory = limits.memory.as_ref().expect("Should have memory limit");
+        match memory {
+            policy::MemoryLimit::String(mem_str) => {
+                assert_eq!(mem_str, "512Mi");
+            }
+            _ => panic!("Expected string memory limit"),
+        }
+
+        // Now test removing the memory resource permission
+        manager
+            .manager
+            .policy_manager
+            .remove_resource_permission_from_policy(&mut policy, resource_details)?;
+
+        // Verify memory limit was removed
+        if let Some(resources) = &policy.permissions.resources {
+            if let Some(limits) = &resources.limits {
+                assert!(limits.memory.is_none(), "Memory limit should be removed");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_revoke_memory_resource_permission_parsing() -> Result<()> {
+        let manager = create_test_manager().await?;
+
+        // Test the permission parsing and revocation logic without requiring component compilation
+        let memory_details = serde_json::json!({"memory": "1Gi"});
+
+        // Test that we can parse the memory resource permission rule
+        let permission_rule = manager
+            .manager
+            .policy_manager
+            .parse_permission_rule("resource", &memory_details)?;
+
+        // Verify it creates a Custom permission rule for resource type
+        match &permission_rule {
+            PermissionRule::Custom(type_name, details) => {
+                assert_eq!(type_name, "resource");
+                // The structure should be a ResourceLimits with limits containing memory
+                assert!(details.get("limits").is_some());
+                let limits = details.get("limits").unwrap();
+                assert!(limits.get("memory").is_some());
+                let memory = limits.get("memory").unwrap();
+                assert_eq!(memory.as_str().unwrap(), "1Gi");
+            }
+            _ => panic!("Expected Custom permission rule for resource type"),
+        }
+
+        // Test validation doesn't fail for resource permissions
+        manager
+            .manager
+            .policy_manager
+            .validate_permission_rule(&permission_rule)?;
+
+        Ok(())
+    }
+}

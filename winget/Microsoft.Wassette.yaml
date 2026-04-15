@@ -1,0 +1,51 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.singleton.1.6.0.schema.json
+
+PackageIdentifier: Microsoft.Wassette
+PackageVersion: 0.4.0
+PackageLocale: en-US
+Publisher: Microsoft Corporation
+PublisherUrl: https://github.com/microsoft/wassette
+PublisherSupportUrl: https://github.com/microsoft/wassette/issues
+Author: Microsoft Corporation
+PackageName: Wassette
+PackageUrl: https://github.com/microsoft/wassette
+License: MIT
+LicenseUrl: https://github.com/microsoft/wassette/blob/main/LICENSE
+Copyright: Copyright (c) Microsoft Corporation
+CopyrightUrl: https://github.com/microsoft/wassette/blob/main/LICENSE
+ShortDescription: A security-oriented runtime that runs WebAssembly Components via MCP
+Description: |-
+  Wassette is a security-oriented runtime that runs WebAssembly Components via MCP (Model Context Protocol).
+  It makes it easy to extend AI agents with new tools, all without ever having to leave the chat window.
+  Wasm Components built for Wassette are generic and reusable, and Wassette is built on the Wasmtime security
+  sandbox, providing browser-grade isolation of tools.
+Moniker: wassette
+Tags:
+- mcp
+- webassembly
+- wasm
+- ai-tools
+- security
+- sandbox
+- runtime
+- component
+ReleaseDate: 2026-02-04
+Installers:
+- Architecture: x64
+  InstallerType: zip
+  InstallerUrl: https://github.com/microsoft/wassette/releases/download/v0.4.0/wassette_0.4.0_windows_amd64.zip
+  InstallerSha256: f6a5f18f61b313c5dd2c7fef0a2863b1df02522da3eba855ecbebe9e8e600206
+  NestedInstallerType: portable
+  NestedInstallerFiles:
+  - RelativeFilePath: wassette.exe
+    PortableCommandAlias: wassette
+- Architecture: arm64
+  InstallerType: zip
+  InstallerUrl: https://github.com/microsoft/wassette/releases/download/v0.4.0/wassette_0.4.0_windows_arm64.zip
+  InstallerSha256: d12e8909a0a1750d20a96390189a64b530c4250839e7978ea4ac0e33a3c84e96
+  NestedInstallerType: portable
+  NestedInstallerFiles:
+  - RelativeFilePath: wassette.exe
+    PortableCommandAlias: wassette
+ManifestType: singleton
+ManifestVersion: 1.6.0

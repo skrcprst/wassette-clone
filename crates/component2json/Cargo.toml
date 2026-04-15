@@ -1,0 +1,16 @@
+[package]
+name = "component2json"
+version = "0.1.0"
+edition = "2021"
+description = "A library for converting WebAssembly Interface Types (WIT) to JSON Schema and back"
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+wasmtime = { workspace = true }
+wasmparser = "0.245"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+wat = "1.245"

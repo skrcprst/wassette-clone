@@ -1,0 +1,47 @@
+# Cargo-deny configuration for wassette
+# Documentation: https://embarkstudios.github.io/cargo-deny/
+
+# Advisory database configuration
+[advisories]
+# Ignore list for known issues that are acceptable
+ignore = [
+    # paste crate is unmaintained but still widely used and safe
+    { id = "RUSTSEC-2024-0436", reason = "paste crate is unmaintained but still widely used and safe" },
+    # rustls-pemfile is unmaintained but pulled in transitively by testcontainers -> bollard
+    # Migration to rustls-pki-types is recommended but depends on upstream updates
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is transitively required by testcontainers and still safe despite being unmaintained" },
+    # fxhash is unmaintained but still widely used and safe; pulled in transitively by wasmtime
+    { id = "RUSTSEC-2025-0057", reason = "fxhash is transitively required by wasmtime and still safe despite being unmaintained" },
+]
+
+# License checking configuration
+[licenses]
+# Explicitly allowed licenses - OSI approved and commonly used licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "OpenSSL",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+# Dependency bans configuration
+[bans]
+# Allow multiple versions with warnings (common in large dependency graphs)
+multiple-versions = "warn"
+# Allow wildcard version requirements
+wildcards = "allow"
+
+# Source checking configuration  
+[sources]
+# Only allow crates from crates.io
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+unknown-registry = "deny"
+unknown-git = "deny"

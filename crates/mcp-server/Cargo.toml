@@ -1,0 +1,18 @@
+[package]
+name = "mcp-server"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+rmcp = { workspace = true }
+wassette = { workspace = true }
+tracing = { workspace = true, features = ["attributes"] }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }

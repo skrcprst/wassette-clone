@@ -1,0 +1,40 @@
+[package]
+name = "wassette"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+component2json = { path = "../component2json" }
+etcetera = { workspace = true }
+futures = { workspace = true }
+hex = "0.4"
+http = "1.4"
+num_cpus = "1.0"
+hyper = { version = "1.7", features = ["client"] }
+oci-client = { workspace = true }
+oci-wasm = { workspace = true }
+policy = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+serde_yaml = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-util = { workspace = true, features = ["io"] }
+tracing = { workspace = true, features = ["attributes"] }
+url = "2.5"
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
+wasmtime-wasi-http = { workspace = true }
+wasmtime-wasi-config = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.10"
+temp-env = "0.3"
+test-log = { workspace = true, features = ["trace"] }
+tokio-test = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing-test = { workspace = true }

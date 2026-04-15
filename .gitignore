@@ -1,0 +1,15 @@
+/target
+/bin
+.DS_Store
+/result
+# Env and .envrc files
+.env*
+
+# mdbook output
+/docs/book
+mdbook
+mdbook-mermaid
+
+# typos binary
+typos
+__pycache__/

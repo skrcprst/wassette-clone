@@ -1,0 +1,19 @@
+$schema: https://raw.githubusercontent.com/microsoft/policy-mcp/main/schema/policy-v1.0.schema.json
+version: "1.0"
+description: "Policy with k8s-style resource limits"
+permissions:
+  storage:
+    allow:
+    - uri: "fs://workspace/**"
+      access: ["read", "write"]
+    - uri: "fs://config/app.yaml"
+      access: ["read"]
+      
+  network:
+    allow:
+    - host: "api.openai.com"
+      
+  resources:
+    limits:
+      cpu: "500m"               # millicores (k8s-style)
+      memory: "512Mi"           # human-readable (Ki, Mi, Gi)

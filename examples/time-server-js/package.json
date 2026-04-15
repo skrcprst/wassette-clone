@@ -1,0 +1,13 @@
+{
+  "name": "time-server",
+  "version": "1.0.0",
+  "main": "time.js",
+  "scripts": {
+    "build": "jco componentize ./time.js --wit ./wit -d http -d random -d stdio -o ./time.wasm"
+  },
+  "license": "Apache-2.0",
+  "dependencies": {
+        "@bytecodealliance/componentize-js": "0.19.3",
+        "@bytecodealliance/jco": "^1.17.0"
+  }
+} 
